@@ -998,6 +998,9 @@ func (c *Controller) LinkPhysicalAddress(w http.ResponseWriter, r *http.Request,
 		writeTime = time.Unix(*mtime, 0)
 	}
 	fullPhysicalAddress := swag.StringValue(body.Staging.PhysicalAddress)
+	if !c.authorizePhysicalAddress(w, r, repo.StorageNamespace, fullPhysicalAddress) {
+		return
+	}
 	physicalAddress, addressType := c.normalizePhysicalAddress(repo.StorageNamespace, fullPhysicalAddress)
 
 	if addressType == catalog.AddressTypeRelative {
@@ -1080,6 +1083,47 @@ func (c *Controller) normalizePhysicalAddress(storageNamespace, physicalAddress 
 		return physicalAddress[len(prefix):], catalog.AddressTypeRelative
 	}
 	return physicalAddress, catalog.AddressTypeFull
+}
+
+// authorizePhysicalAddress checks an address that a caller asks to stage or
+// link. It refuses "." and ".." segments, and an address outside the
+// repository's storage namespace needs fs:ImportFromStorage on that address,
+// as an import does. Without this, a user who may write to one repository can
+// link an object of any other repository on the same storage, and read it.
+func (c *Controller) authorizePhysicalAddress(w http.ResponseWriter, r *http.Request, storageNamespace, address string) bool {
+	if hasDotSegment(address) {
+		writeError(w, r, http.StatusBadRequest, "physical address must not have . or .. segments")
+		return false
+	}
+	if _, addressType := c.normalizePhysicalAddress(storageNamespace, address); addressType != catalog.AddressTypeFull {
+		return true
+	}
+	return c.authorize(w, r, permissions.Node{
+		Permission: permissions.Permission{
+			Action:   permissions.ImportFromStorageAction,
+			Resource: permissions.StorageNamespace(address),
+		},
+	})
+}
+
+// hasDotSegment reports whether a storage URI has a "." or ".." path
+// segment, before or after percent-decoding, or cannot be decoded.
+func hasDotSegment(uri string) bool {
+	if i := strings.Index(uri, "://"); i >= 0 {
+		uri = uri[i+len("://"):]
+	}
+	decoded, err := url.PathUnescape(uri)
+	if err != nil {
+		return true
+	}
+	for _, s := range []string{uri, decoded} {
+		for _, segment := range strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == '\\' }) {
+			if segment == "." || segment == ".." {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *Controller) ListGroups(w http.ResponseWriter, r *http.Request, params apigen.ListGroupsParams) {
@@ -2257,6 +2301,14 @@ func (c *Controller) ListRepositories(w http.ResponseWriter, r *http.Request, pa
 func (c *Controller) CreateRepository(w http.ResponseWriter, r *http.Request, body apigen.CreateRepositoryJSONRequestBody, params apigen.CreateRepositoryParams) {
 	storageID := config.GetActualStorageID(c.Config.StorageConfig(), swag.StringValue(body.StorageId))
 	storageNamespace := body.StorageNamespace
+	if hasDotSegment(storageNamespace) || strings.ContainsAny(storageNamespace, "@?#") {
+		// A namespace such as local://acme-x/../globex-y passes a policy on
+		// namespace/local://acme-* but names another repository's storage.
+		// So does local://acme-x@globex-y for the commit cache, which takes
+		// the host part of the URL.
+		writeError(w, r, http.StatusBadRequest, "storage namespace must not have . or .. segments, or @, ? or #")
+		return
+	}
 
 	if !c.authorize(w, r, permissions.Node{
 		Type: permissions.NodeTypeAnd,
@@ -3059,6 +3111,7 @@ func handleApiErrorCallback(log logging.Logger, w http.ResponseWriter, r *http.R
 		cb(w, r, http.StatusUnauthorized, ErrAuthenticatingRequest)
 
 	case errors.Is(err, graveler.ErrNotFound),
+		errors.Is(err, graveler.ErrMetaRangeNotFound),
 		errors.Is(err, actions.ErrNotFound),
 		errors.Is(err, auth.ErrNotFound),
 		errors.Is(err, kv.ErrNotFound),
@@ -3715,6 +3768,9 @@ func (c *Controller) StageObject(w http.ResponseWriter, r *http.Request, body ap
 
 	repo, err := c.Catalog.GetRepository(ctx, repository)
 	if c.handleAPIError(ctx, w, r, err) {
+		return
+	}
+	if !c.authorizePhysicalAddress(w, r, repo.StorageNamespace, body.PhysicalAddress) {
 		return
 	}
 	// write metadata

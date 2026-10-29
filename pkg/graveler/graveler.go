@@ -342,6 +342,22 @@ type CommitID string
 // MetaRangeID represents a snapshot of the MetaRange, referenced by a commit
 type MetaRangeID string
 
+// ValidateMetaRangeID checks that a meta-range ID that a caller gave is one
+// plain file name: letters, digits, "_" and "-". Every ID that lakeFS makes is
+// hex. The ID names a file, so a "/", "\\", "%" or "." could reach files
+// outside the repository.
+func ValidateMetaRangeID(id MetaRangeID) error {
+	if id == "" {
+		return fmt.Errorf("%w: empty meta-range ID", ErrInvalidValue)
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && r != '_' && r != '-' {
+			return fmt.Errorf("%w: meta-range ID must be letters, digits, _ and -: %q", ErrInvalidValue, id)
+		}
+	}
+	return nil
+}
+
 // RangeID represents a part of a MetaRange, useful only for plumbing.
 type RangeID string
 
@@ -2244,6 +2260,20 @@ func (g *Graveler) Commit(ctx context.Context, repository *RepositoryRecord, bra
 		storageNamespace StorageNamespace
 		sealedToDrop     []StagingToken
 	)
+	if params.SourceMetaRange != nil {
+		// The branch will point at this meta-range, so it must be a real one:
+		// a name that is not an ID can reach files outside the repository.
+		if err := ValidateMetaRangeID(*params.SourceMetaRange); err != nil {
+			return "", err
+		}
+		ok, err := g.CommittedManager.Exists(ctx, repository.StorageID, repository.StorageNamespace, *params.SourceMetaRange)
+		if err != nil {
+			return "", fmt.Errorf("checking for meta range %s: %w", *params.SourceMetaRange, err)
+		}
+		if !ok {
+			return "", fmt.Errorf("%w: %s", ErrMetaRangeNotFound, *params.SourceMetaRange)
+		}
+	}
 	isProtected, err := g.protectedBranchesManager.IsBlocked(ctx, repository, branchID, BranchProtectionBlockedAction_COMMIT)
 	if err != nil {
 		return "", err
@@ -2409,6 +2439,11 @@ func (g *Graveler) CreateCommitRecord(ctx context.Context, repository *Repositor
 	options := NewSetOptions(opts)
 	if repository.ReadOnly && !options.Force {
 		return ErrReadOnlyRepository
+	}
+	if commit.MetaRangeID != "" {
+		if err := ValidateMetaRangeID(commit.MetaRangeID); err != nil {
+			return err
+		}
 	}
 
 	return g.RefManager.CreateCommitRecord(ctx, repository, commitID, commit)
@@ -3551,6 +3586,9 @@ func (g *Graveler) SetHooksHandler(handler HooksHandler) {
 
 func (g *Graveler) LoadCommits(ctx context.Context, repository *RepositoryRecord, metaRangeID MetaRangeID, opts ...SetOptionsFunc) error {
 	options := NewSetOptions(opts)
+	if err := ValidateMetaRangeID(metaRangeID); err != nil {
+		return err
+	}
 	if repository.ReadOnly && !options.Force {
 		return ErrReadOnlyRepository
 	}
@@ -3600,6 +3638,9 @@ func (g *Graveler) LoadCommits(ctx context.Context, repository *RepositoryRecord
 
 func (g *Graveler) LoadBranches(ctx context.Context, repository *RepositoryRecord, metaRangeID MetaRangeID, opts ...SetOptionsFunc) error {
 	options := NewSetOptions(opts)
+	if err := ValidateMetaRangeID(metaRangeID); err != nil {
+		return err
+	}
 	if repository.ReadOnly && !options.Force {
 		return ErrReadOnlyRepository
 	}
@@ -3633,6 +3674,9 @@ func (g *Graveler) LoadBranches(ctx context.Context, repository *RepositoryRecor
 
 func (g *Graveler) LoadTags(ctx context.Context, repository *RepositoryRecord, metaRangeID MetaRangeID, opts ...SetOptionsFunc) error {
 	options := NewSetOptions(opts)
+	if err := ValidateMetaRangeID(metaRangeID); err != nil {
+		return err
+	}
 	if repository.ReadOnly && !options.Force {
 		return ErrReadOnlyRepository
 	}

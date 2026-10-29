@@ -333,6 +333,9 @@ func (tfs *TierFS) Open(ctx context.Context, storageID, namespace, filename stri
 }
 
 func (tfs *TierFS) Exists(ctx context.Context, storageID, namespace, filename string) (bool, error) {
+	if err := validateFilename(filename); err != nil {
+		return false, err
+	}
 	cacheAccess.WithLabelValues(tfs.fsName, "Exists").Inc()
 	return tfs.adapter.Exists(ctx, tfs.objPointer(storageID, namespace, filename))
 }
@@ -483,6 +486,18 @@ func (tfs *TierFS) wrapFile(ctx context.Context, fileRef localFileRef, fh *os.Fi
 }
 
 func validateFilename(filename string) error {
+	// A file name comes from a range or metarange ID, which a caller can set
+	// (for example source_metarange on a commit). A "." or ".." segment, an
+	// absolute name or a backslash would reach files outside the namespace,
+	// in the cache and on the block store.
+	if filename == "" || filepath.IsAbs(filename) || strings.ContainsRune(filename, '\\') {
+		return errBadFilename
+	}
+	for _, segment := range strings.Split(filename, "/") {
+		if segment == "." || segment == ".." {
+			return errBadFilename
+		}
+	}
 	if strings.HasPrefix(filename, workspaceDir+string(os.PathSeparator)) {
 		return errPathInWorkspace
 	}

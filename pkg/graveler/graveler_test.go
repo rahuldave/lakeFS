@@ -3504,3 +3504,16 @@ func TestGraveler_CherryPickHooks(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateMetaRangeID(t *testing.T) {
+	for _, id := range []graveler.MetaRangeID{"", ".", "..", "../x", "../../../etc/hosts", "a/b", `a\b`, "abc%2f", "abc def", "a.b"} {
+		if graveler.ValidateMetaRangeID(id) == nil {
+			t.Errorf("ValidateMetaRangeID(%q) accepted a name that is not a meta-range ID", id)
+		}
+	}
+	for _, id := range []graveler.MetaRangeID{"0", "deadbeef", "2e1a1b6c8d0f", "expectedRangeID", "meta_range-1"} {
+		if err := graveler.ValidateMetaRangeID(id); err != nil {
+			t.Errorf("ValidateMetaRangeID(%q) = %v, want nil", id, err)
+		}
+	}
+}
