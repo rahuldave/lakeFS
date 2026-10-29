@@ -159,6 +159,17 @@ func (s *AuthService) DeleteUser(ctx context.Context, username string) error {
 		return err
 	}
 
+	// delete the user's keys, so a new user of the same name does not get them
+	creds, _, err := s.ListUserCredentials(ctx, username, &model.PaginationParams{Amount: -1})
+	if err != nil {
+		return err
+	}
+	for _, cred := range creds {
+		if err = s.DeleteCredentials(ctx, username, cred.AccessKeyID); err != nil && !errors.Is(err, auth.ErrNotFound) {
+			return err
+		}
+	}
+
 	// delete user
 	err = s.store.Delete(ctx, []byte(model.PartitionKey), userPath)
 	if err != nil {
@@ -272,6 +283,13 @@ func (s *AuthService) AttachPolicyToUser(ctx context.Context, policyDisplayName 
 		}
 		return fmt.Errorf("policy attachment to user: (key %s): %w", pu, err)
 	}
+	// A policy deleted while this attach ran must not keep the attachment.
+	if _, err := s.GetPolicy(ctx, policyDisplayName); errors.Is(err, auth.ErrNotFound) {
+		if detachErr := s.DetachPolicyFromUserNoValidation(ctx, policyDisplayName, username); detachErr != nil {
+			return detachErr
+		}
+		return err
+	}
 	return nil
 }
 
@@ -288,9 +306,8 @@ func (s *AuthService) DetachPolicyFromUser(ctx context.Context, policyDisplayNam
 	if _, err := s.GetUser(ctx, username); err != nil {
 		return err
 	}
-	if _, err := s.GetPolicy(ctx, policyDisplayName); err != nil {
-		return err
-	}
+	// No check that the policy exists: a link left by a delete that failed
+	// part way must still be removable.
 	return s.DetachPolicyFromUserNoValidation(ctx, policyDisplayName, username)
 }
 
@@ -445,6 +462,18 @@ func (s *AuthService) CreateGroup(ctx context.Context, group *model.Group) (*mod
 }
 
 func (s *AuthService) DeleteGroup(ctx context.Context, groupID string) error {
+	if err := s.deleteGroup(ctx, groupID); err != nil {
+		return err
+	}
+	// The group's own ACL policy goes with it, so no stale ACL(_-_)<group>
+	// waits for a new group of the same name.
+	if err := s.DeletePolicy(ctx, PolicyName(groupID)); err != nil && !errors.Is(err, auth.ErrNotFound) {
+		return fmt.Errorf("delete the ACL policy of group %s: %w", groupID, err)
+	}
+	return nil
+}
+
+func (s *AuthService) deleteGroup(ctx context.Context, groupID string) error {
 	if _, err := s.GetGroup(ctx, groupID); err != nil {
 		return err
 	}
@@ -473,7 +502,7 @@ func (s *AuthService) DeleteGroup(ctx context.Context, groupID string) error {
 	if err != nil {
 		return err
 	}
-	defer it.Close()
+	defer itr.Close()
 	for itr.Next() {
 		entry := itr.Entry()
 		policy := entry.Value.(*model.PolicyData)
@@ -679,47 +708,55 @@ func (s *AuthService) GetPolicy(ctx context.Context, policyDisplayName string) (
 }
 
 func (s *AuthService) DeletePolicy(ctx context.Context, policyDisplayName string) error {
-	if _, err := s.GetPolicy(ctx, policyDisplayName); err != nil {
-		return err
+	_, getErr := s.GetPolicy(ctx, policyDisplayName)
+	if getErr != nil && !errors.Is(getErr, auth.ErrNotFound) {
+		return getErr
 	}
 	policyPath := model.PolicyPath(policyDisplayName)
 
-	// delete policy attachment to user
+	// Delete the policy first, so an attach that comes later fails. Then
+	// remove every attachment, so none is left to grant a new policy of the
+	// same name. A policy that is already gone still has its attachments
+	// removed, so retrying a delete that failed part way cleans up, and the
+	// answer is still not found.
+	if getErr == nil {
+		if err := s.store.Delete(ctx, []byte(model.PartitionKey), policyPath); err != nil {
+			return fmt.Errorf("delete policy (policyKey %s): %w", policyPath, err)
+		}
+	}
+
 	usersKey := model.UserPath("")
-	it, err := kv.NewPrimaryIterator(ctx, s.store, (&model.UserData{}).ProtoReflect().Type(), model.PartitionKey, usersKey, kv.IteratorOptionsAfter([]byte("")))
+	userIt, err := kv.NewPrimaryIterator(ctx, s.store, (&model.UserData{}).ProtoReflect().Type(), model.PartitionKey, usersKey, kv.IteratorOptionsAfter([]byte("")))
 	if err != nil {
 		return err
 	}
-	defer it.Close()
-	for it.Next() {
-		entry := it.Entry()
-		user := entry.Value.(*model.UserData)
+	defer userIt.Close()
+	for userIt.Next() {
+		user := userIt.Entry().Value.(*model.UserData)
 		if err = s.DetachPolicyFromUserNoValidation(ctx, policyDisplayName, user.Username); err != nil {
 			return err
 		}
 	}
+	if err := userIt.Err(); err != nil {
+		return fmt.Errorf("delete policy %s: list users: %w", policyDisplayName, err)
+	}
 
-	// delete policy attachment to group
 	groupKey := model.GroupPath("")
-	it, err = kv.NewPrimaryIterator(ctx, s.store, (&model.GroupData{}).ProtoReflect().Type(), model.PartitionKey, groupKey, kv.IteratorOptionsAfter([]byte("")))
+	groupIt, err := kv.NewPrimaryIterator(ctx, s.store, (&model.GroupData{}).ProtoReflect().Type(), model.PartitionKey, groupKey, kv.IteratorOptionsAfter([]byte("")))
 	if err != nil {
 		return err
 	}
-	defer it.Close()
-	for it.Next() {
-		entry := it.Entry()
-		group := entry.Value.(*model.GroupData)
+	defer groupIt.Close()
+	for groupIt.Next() {
+		group := groupIt.Entry().Value.(*model.GroupData)
 		if err = s.DetachPolicyFromGroupNoValidation(ctx, policyDisplayName, group.DisplayName); err != nil {
 			return err
 		}
 	}
-
-	// delete policy
-	err = s.store.Delete(ctx, []byte(model.PartitionKey), policyPath)
-	if err != nil {
-		return fmt.Errorf("delete policy (policyKey %s): %w", policyPath, err)
+	if err := groupIt.Err(); err != nil {
+		return fmt.Errorf("delete policy %s: list groups: %w", policyDisplayName, err)
 	}
-	return nil
+	return getErr
 }
 
 func (s *AuthService) ListPolicies(ctx context.Context, params *model.PaginationParams) ([]*model.Policy, *model.Paginator, error) {
@@ -816,6 +853,13 @@ func (s *AuthService) AttachPolicyToGroup(ctx context.Context, policyDisplayName
 		}
 		return fmt.Errorf("policy attachment to group: (key %s): %w", pg, err)
 	}
+	// A policy deleted while this attach ran must not keep the attachment.
+	if _, err := s.GetPolicy(ctx, policyDisplayName); errors.Is(err, auth.ErrNotFound) {
+		if detachErr := s.DetachPolicyFromGroupNoValidation(ctx, policyDisplayName, groupDisplayName); detachErr != nil {
+			return detachErr
+		}
+		return err
+	}
 	return nil
 }
 
@@ -832,9 +876,8 @@ func (s *AuthService) DetachPolicyFromGroup(ctx context.Context, policyDisplayNa
 	if _, err := s.GetGroup(ctx, groupDisplayName); err != nil {
 		return err
 	}
-	if _, err := s.GetPolicy(ctx, policyDisplayName); err != nil {
-		return err
-	}
+	// No check that the policy exists: a link left by a delete that failed
+	// part way must still be removable.
 	return s.DetachPolicyFromGroupNoValidation(ctx, policyDisplayName, groupDisplayName)
 }
 

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-openapi/swag"
@@ -101,6 +103,9 @@ func (c *Controller) CreateGroup(w http.ResponseWriter, r *http.Request, body ap
 }
 
 func (c *Controller) DeleteGroup(w http.ResponseWriter, r *http.Request, groupID string) {
+	if refuseBuiltInPolicy(w, groupID == AdminsGroup) {
+		return
+	}
 	ctx := r.Context()
 	err := c.Auth.DeleteGroup(ctx, groupID)
 	if errors.Is(err, auth.ErrNotFound) {
@@ -205,8 +210,16 @@ func (c *Controller) ListGroupPolicies(w http.ResponseWriter, r *http.Request, g
 	writeResponse(w, http.StatusOK, response)
 }
 
-func (c *Controller) DetachPolicyFromGroup(w http.ResponseWriter, _ *http.Request, _, _ string) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+func (c *Controller) DetachPolicyFromGroup(w http.ResponseWriter, r *http.Request, groupID, policyID string) {
+	if refuseBuiltInPolicy(w, policyID == PolicyName(groupID)) {
+		return
+	}
+	ctx := r.Context()
+	err := c.Auth.DetachPolicyFromGroup(ctx, policyID, groupID)
+	if c.handleAPIError(w, err) {
+		return
+	}
+	writeResponse(w, http.StatusNoContent, nil)
 }
 
 func (c *Controller) AttachPolicyToGroup(w http.ResponseWriter, r *http.Request, groupID, policyID string) {
@@ -218,12 +231,85 @@ func (c *Controller) AttachPolicyToGroup(w http.ResponseWriter, r *http.Request,
 	writeResponse(w, http.StatusCreated, nil)
 }
 
-func (c *Controller) ListPolicies(w http.ResponseWriter, _ *http.Request, _ apigen.ListPoliciesParams) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+// isGroupACLPolicy reports whether policyID is the ACL policy of a group
+// that exists, ACL(_-_)<group>.
+func (c *Controller) isGroupACLPolicy(ctx context.Context, policyID string) bool {
+	if !IsPolicyName(policyID) {
+		return false
+	}
+	_, err := c.Auth.GetGroup(ctx, strings.TrimPrefix(policyID, PolicyPrefix))
+	return !errors.Is(err, auth.ErrNotFound) // an error reading the group still guards it
+}
+
+// isAdminsPolicy reports whether a body for ACL(_-_)Admins holds exactly the
+// Admin ACL's statements. Only then may it be written, so the repair can
+// always restore it and nothing else can be planted in it.
+func isAdminsPolicy(stmts []apigen.Statement) bool {
+	want, err := ACLToStatement(model.ACL{Permission: AdminPermission})
+	if err != nil || len(stmts) != len(want) {
+		return false
+	}
+	for i, s := range stmts {
+		if s.Effect != want[i].Effect || s.Resource != want[i].Resource || !slices.Equal(s.Action, want[i].Action) {
+			return false
+		}
+	}
+	return true
+}
+
+// refuseBuiltInPolicy answers 400 when refuse is true. It guards the
+// ACL policies of groups, ACL(_-_)<group>: deleting one of a group that
+// exists, detaching a group's own one, or writing over the Admins one would
+// leave groups, and the admin among them, unable to do anything.
+// WriteGroupACL never does these; it writes and attaches the others. Making
+// an ACL policy for an existing group is allowed, since it never
+// overwrites, so a lost one can be made again.
+func refuseBuiltInPolicy(w http.ResponseWriter, refuse bool) bool {
+	if !refuse {
+		return false
+	}
+	writeError(w, http.StatusBadRequest, "built-in ACL policies cannot be changed this way")
+	return true
+}
+
+func (c *Controller) ListPolicies(w http.ResponseWriter, r *http.Request, params apigen.ListPoliciesParams) {
+	ctx := r.Context()
+	policies, paginator, err := c.Auth.ListPolicies(ctx, &model.PaginationParams{
+		After:  swag.StringValue((*string)(params.After)),
+		Prefix: swag.StringValue((*string)(params.Prefix)),
+		Amount: paginationAmount(params.Amount),
+	})
+	if c.handleAPIError(w, err) {
+		return
+	}
+
+	response := apigen.PolicyList{
+		Results: make([]apigen.Policy, 0, len(policies)),
+		Pagination: apigen.Pagination{
+			HasMore:    paginator.NextPageToken != "",
+			NextOffset: paginator.NextPageToken,
+			Results:    paginator.Amount,
+		},
+	}
+	for _, p := range policies {
+		response.Results = append(response.Results, serializePolicy(p))
+	}
+
+	writeResponse(w, http.StatusOK, response)
 }
 
 func (c *Controller) CreatePolicy(w http.ResponseWriter, r *http.Request, body apigen.CreatePolicyJSONRequestBody) {
 	ctx := r.Context()
+	if body.Name == PolicyName(AdminsGroup) && !isAdminsPolicy(body.Statement) {
+		writeError(w, http.StatusBadRequest, "the Admins ACL policy must hold exactly the Admin statements")
+		return
+	}
+	if IsPolicyName(body.Name) && !c.isGroupACLPolicy(ctx, body.Name) {
+		// An ACL policy name belongs to a group; one for no group could
+		// never be deleted once that group appeared.
+		writeError(w, http.StatusBadRequest, "an ACL policy name must name an existing group")
+		return
+	}
 
 	stmts := make(model.Statements, len(body.Statement))
 	for i, apiStatement := range body.Statement {
@@ -251,8 +337,20 @@ func (c *Controller) CreatePolicy(w http.ResponseWriter, r *http.Request, body a
 	writeResponse(w, http.StatusCreated, serializePolicy(p))
 }
 
-func (c *Controller) DeletePolicy(w http.ResponseWriter, _ *http.Request, _ string) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+func (c *Controller) DeletePolicy(w http.ResponseWriter, r *http.Request, policyID string) {
+	if refuseBuiltInPolicy(w, c.isGroupACLPolicy(r.Context(), policyID)) {
+		return
+	}
+	ctx := r.Context()
+	err := c.Auth.DeletePolicy(ctx, policyID)
+	if errors.Is(err, auth.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "policy not found")
+		return
+	}
+	if c.handleAPIError(w, err) {
+		return
+	}
+	writeResponse(w, http.StatusNoContent, nil)
 }
 
 func (c *Controller) GetPolicy(w http.ResponseWriter, r *http.Request, policyID string) {
@@ -271,6 +369,9 @@ func (c *Controller) GetPolicy(w http.ResponseWriter, r *http.Request, policyID 
 }
 
 func (c *Controller) UpdatePolicy(w http.ResponseWriter, r *http.Request, body apigen.UpdatePolicyJSONRequestBody, policyID string) {
+	if refuseBuiltInPolicy(w, policyID == PolicyName(AdminsGroup) && !isAdminsPolicy(body.Statement)) {
+		return
+	}
 	ctx := r.Context()
 
 	stmts := make(model.Statements, len(body.Statement))
@@ -591,12 +692,22 @@ func serializePolicy(p *model.Policy) apigen.Policy {
 	}
 }
 
-func (c *Controller) DetachPolicyFromUser(w http.ResponseWriter, _ *http.Request, _, _ string) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+func (c *Controller) DetachPolicyFromUser(w http.ResponseWriter, r *http.Request, userID, policyID string) {
+	ctx := r.Context()
+	err := c.Auth.DetachPolicyFromUser(ctx, policyID, userID)
+	if c.handleAPIError(w, err) {
+		return
+	}
+	writeResponse(w, http.StatusNoContent, nil)
 }
 
-func (c *Controller) AttachPolicyToUser(w http.ResponseWriter, _ *http.Request, _, _ string) {
-	writeError(w, http.StatusNotImplemented, "Not implemented")
+func (c *Controller) AttachPolicyToUser(w http.ResponseWriter, r *http.Request, userID, policyID string) {
+	ctx := r.Context()
+	err := c.Auth.AttachPolicyToUser(ctx, policyID, userID)
+	if c.handleAPIError(w, err) {
+		return
+	}
+	writeResponse(w, http.StatusCreated, nil)
 }
 
 func (c *Controller) GetVersion(w http.ResponseWriter, _ *http.Request) {

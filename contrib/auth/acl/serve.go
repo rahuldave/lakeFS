@@ -3,6 +3,7 @@ package acl
 //go:generate go run github.com/deepmap/oapi-codegen/cmd/oapi-codegen@v1.5.6 -package apigen -generate "types,chi-server,spec" -templates ../../../pkg/api/tmpl -o ../apigen/authapi.gen.go ../../../api/authorization.yml
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -29,8 +30,11 @@ type responseError struct {
 
 var ErrInvalidAPIEndpoint = errors.New("invalid API endpoint")
 
-func Serve(authService auth.Service, logger logging.Logger) http.Handler {
+func Serve(authService auth.Service, logger logging.Logger, apiToken string) http.Handler {
 	logger.Info("Initialize Auth API server")
+	if apiToken == "" {
+		logger.Warn("api_token is not set, so the auth API accepts every caller")
+	}
 	swagger, err := apigen.GetSwagger()
 	if err != nil {
 		panic(err)
@@ -39,6 +43,7 @@ func Serve(authService auth.Service, logger logging.Logger) http.Handler {
 
 	r := chi.NewRouter()
 	apiRouter := r.With(
+		RequireToken(apiToken),
 		OapiRequestValidatorWithOptions(
 			swagger,
 			&openapi3filter.Options{
@@ -50,6 +55,21 @@ func Serve(authService auth.Service, logger logging.Logger) http.Handler {
 	r.Mount("/_health", httputil.ServeHealth())
 	r.Mount(BaseURL, http.HandlerFunc(InvalidAPIEndpointHandler))
 	return r
+}
+
+// RequireToken refuses a request without "Authorization: Bearer <token>".
+// An empty token lets every request through, as before.
+func RequireToken(token string) func(http.Handler) http.Handler {
+	want := []byte("Bearer " + token)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if token != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+				writeError(w, http.StatusUnauthorized, "missing or wrong api token")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // OapiRequestValidatorWithOptions Creates middleware to validate request by swagger spec.

@@ -25,6 +25,10 @@ type HTTPClient struct {
 
 type Config struct {
 	ListenAddress string `mapstructure:"listen_address"`
+	// APIToken, when set, is the bearer token that every API call must
+	// carry. lakeFS sends its auth.api.token this way. Without it, anyone
+	// who reaches the server can make users, keys and policies.
+	APIToken config.SecureString `mapstructure:"api_token"`
 
 	Database config.Database
 	Encrypt  struct {

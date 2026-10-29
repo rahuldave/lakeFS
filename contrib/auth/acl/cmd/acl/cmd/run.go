@@ -51,7 +51,7 @@ var runCmd = &cobra.Command{
 			logger.WithError(err).Fatal("failed to query auth service")
 		}
 
-		authAPIHandler := acl.Serve(authService, logger.WithField("service", "auth_api"))
+		authAPIHandler := acl.Serve(authService, logger.WithField("service", "auth_api"), cfg.APIToken.SecureValue())
 		logger.WithField("listen_address", cfg.ListenAddress).Info("Starting Auth server")
 
 		authAPIServer := &http.Server{
