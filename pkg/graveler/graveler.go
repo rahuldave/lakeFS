@@ -1894,6 +1894,14 @@ func (g *Graveler) Set(ctx context.Context, repository *RepositoryRecord, branch
 	}
 
 	log := g.log(ctx).WithFields(logging.Fields{"key": key, "operation": "set"})
+	// written is set once a try has staged the value. safeBranchWrite tries
+	// again if a commit sealed the staging token meanwhile, and the condition
+	// would then see this write in the sealed token and fail, although the
+	// write landed. So a later try accepts a current value equal to this one,
+	// identity and data both. The data holds the physical address, which is
+	// new for each upload, so another writer's value with the same content
+	// still fails.
+	written := false
 	err = g.safeBranchWrite(ctx, log, repository, branchID, safeBranchWriteOptions{MaxTries: options.MaxTries}, func(branch *Branch) error {
 		var err error
 		if options.Condition == nil {
@@ -1903,7 +1911,19 @@ func (g *Graveler) Set(ctx context.Context, repository *RepositoryRecord, branch
 			setFunc := func(_ *Value) (*Value, error) {
 				return &value, nil
 			}
-			err = g.handleUpdate(ctx, repository, branchID, branch, key, setFunc, options.Condition)
+			condition := options.Condition
+			if written {
+				condition = func(current *Value) error {
+					if current != nil && bytes.Equal(current.Identity, value.Identity) && bytes.Equal(current.Data, value.Data) {
+						return nil
+					}
+					return options.Condition(current)
+				}
+			}
+			err = g.handleUpdate(ctx, repository, branchID, branch, key, setFunc, condition)
+			if err == nil {
+				written = true
+			}
 		}
 		if errors.Is(err, kv.ErrPredicateFailed) {
 			return fmt.Errorf("%w: %s", ErrPreconditionFailed, err)

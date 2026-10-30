@@ -16,7 +16,7 @@ make build-binaries VERSION=1.86.0
 
 ## Changes to lakeFS
 
-Each change stops one org from reaching another org's data, when lakeFS uses an external authorization server. With the built-in single-user mode, every permission check passes, so only the checks on names change what lakeFS does.
+Each change but the last stops one org from reaching another org's data, when lakeFS uses an external authorization server. The last fixes conditional writes that race a commit. With the built-in single-user mode, every permission check passes, so only the checks on names change what lakeFS does.
 
 ### Stage and link take only the repository's own storage
 
@@ -38,6 +38,14 @@ A commit's `source_metarange`, a commit record's `metarange_id` and the meta-ran
 - `graveler.ValidateMetaRangeID` takes only letters, digits, `_` and `-`.
 - A commit that names its meta-range checks that it exists. If it does not, lakeFS answers 404.
 - The commit cache, `pkg/pyramid`, refuses absolute file names and `.` or `..` segments.
+
+### A conditional write that lands is not refused
+
+An S3 gateway put with `If-None-Match: *` checks that the key is absent, and then stages the object. `safeBranchWrite` in `pkg/graveler/graveler.go` checks the branch's staging token after the write. If a commit sealed the token meanwhile, it writes again to the new token. The second try checked the condition again, found the first try's object in the sealed token, and failed. So the client got 412, although its object was written and went into the commit.
+
+`Set` now remembers that a try staged the value. A later try accepts a current value equal to its own, in identity and in data. The identity is a hash of size, ETag, metadata and content type, so two uploads of the same bytes share it. The data holds the physical address, which is new for every upload. So a value of another writer still fails the condition, even with the same content.
+
+lakeFS Enterprise 1.107.0 notes the same fix. Open-source lakeFS 1.88.0 still has the bug.
 
 ## Changes to the access-list server
 
@@ -79,13 +87,15 @@ lakeFS's own `WriteGroupACL` still works for every group but Admins. The admin c
 - **`pkg/api/physical_address_test.go`:** the checks on addresses and storage namespaces.
 - **`pkg/graveler/graveler_test.go`, `TestValidateMetaRangeID`:** the meta-range ID rule.
 - **`pkg/pyramid/filename_test.go`:** the cache's file names.
+- **`pkg/graveler/conditional_retry_test.go`:** a conditional write whose token a commit seals, alone, against another writer, and against another writer of the same content.
 - **`contrib/auth/acl/serve_test.go`:** the token, the policy calls, deletes, users, groups and the guards, over HTTP.
 - **provcat's `tests/system/test_lakefs_acl.py`:** each attack above against real servers. It checks isolation through the API, the S3 gateway and provcat, and runs the admin repair.
 
-`go test ./pkg/api ./pkg/graveler/... ./pkg/catalog/... ./pkg/pyramid/... ./contrib/auth/...` passes.
+`go test ./pkg/api ./pkg/graveler/... ./pkg/catalog/... ./pkg/gateway/... ./pkg/pyramid/... ./contrib/auth/...` passes.
 
 ## Known limits
 
 - The guards cover the admin's own policy, not every way an admin can harm itself.
 - lakeFS caches each user's policies for up to 23 seconds, so a revoked policy can work that long.
 - Error messages and stat replies show absolute server paths.
+- `Graveler.Update` passes a condition through the same retry, and keeps the old behaviour. No code outside the tests calls it with a condition.
